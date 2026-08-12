@@ -1,0 +1,7 @@
+fastapi
+uvicorn[standard]
+sqlalchemy>=2
+httpx
+beautifulsoup4
+google-genai
+python-dotenv
