@@ -3,10 +3,10 @@ from fastapi import FastAPI,HTTPException
 from pydantic import BaseModel,Field
 from database import init_db,SessionLocal
 from models import Lead,LeadStatus
-from services.osm import search_businesses
-from services.analyze import analyze_site
-from services.gemini import score
-from services.telegram import notify
+from osm import search_businesses
+from analyze import analyze_site
+from gemini import score
+from telegram import notify
 
 app=FastAPI(title="Garrick AI Outreach",version="1.0.0")
 class SearchRequest(BaseModel):
