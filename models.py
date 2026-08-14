@@ -31,3 +31,19 @@ class Lead(Base):
         d["status"]=self.status.value; d["created_at"]=self.created_at.isoformat()
         if not full:d.pop("analysis",None)
         return d
+
+class Campaign(Base):
+    __tablename__="campaigns"
+    id:Mapped[int]=mapped_column(Integer,primary_key=True)
+    niche:Mapped[str]=mapped_column(String(80))
+    city:Mapped[str]=mapped_column(String(120))
+    leads_per_day:Mapped[int]=mapped_column(Integer)
+    total_days:Mapped[int]=mapped_column(Integer)
+    days_completed:Mapped[int]=mapped_column(Integer,default=0)
+    next_run:Mapped[datetime]=mapped_column(DateTime,index=True)
+    status:Mapped[str]=mapped_column(String(20),default="ACTIVE",index=True)
+    created_at:Mapped[datetime]=mapped_column(DateTime,default=datetime.utcnow)
+    last_run_at:Mapped[datetime|None]=mapped_column(DateTime)
+    last_error:Mapped[str|None]=mapped_column(String(500))
+    telegram_update_id:Mapped[int|None]=mapped_column(Integer,unique=True,index=True)
+    
