@@ -4,6 +4,7 @@ import logging
 import time
 import httpx
 
+
 OVERPASS_URLS = [
     os.getenv(
         "OVERPASS_API_URL",
@@ -13,15 +14,18 @@ OVERPASS_URLS = [
     "https://maps.mail.ru/osm/tools/overpass/api/interpreter",
 ]
 
+
 NOMINATIM = os.getenv(
     "NOMINATIM_URL",
     "https://nominatim.openstreetmap.org/search"
 )
 
+
 UA = os.getenv(
     "OSM_USER_AGENT",
     "GarrickAIOutreach/1.0"
 )
+
 
 MAP = {
     "dentist": [("amenity", "dentist")],
@@ -36,7 +40,17 @@ MAP = {
     "hair salon": [("shop", "hairdresser")],
 }
 
+
 logger = logging.getLogger(__name__)
+
+
+# Cache city coordinates so Garrick does not repeatedly
+# ask Nominatim to resolve the same city.
+_LOCATION_CACHE = {}
+
+# Track the last Nominatim request so we can respect
+# the public Nominatim rate limit.
+_LAST_NOMINATIM_REQUEST = 0.0
 
 
 def norm(u):
@@ -51,27 +65,79 @@ def norm(u):
 
 
 def _get_location(client, city):
-    """Resolve city name to latitude/longitude using Nominatim."""
+    """Resolve city name to latitude/longitude using Nominatim safely."""
 
-    response = client.get(
-        NOMINATIM,
-        params={
-            "q": city,
-            "format": "jsonv2",
-            "limit": 1,
-        },
-    )
+    global _LAST_NOMINATIM_REQUEST
 
-    response.raise_for_status()
+    cache_key = city.strip().lower()
 
-    locations = response.json()
+    # Use cached coordinates when available.
+    cached = _LOCATION_CACHE.get(cache_key)
 
-    if not locations:
-        raise RuntimeError(
-            f"Could not find the location: {city}"
+    if cached:
+        logger.info(
+            "Using cached coordinates for city: %s",
+            city,
+        )
+        return cached
+
+    # Respect Nominatim's public usage rate.
+    elapsed = time.monotonic() - _LAST_NOMINATIM_REQUEST
+
+    if elapsed < 1.1:
+        time.sleep(1.1 - elapsed)
+
+    for attempt in range(3):
+        _LAST_NOMINATIM_REQUEST = time.monotonic()
+
+        response = client.get(
+            NOMINATIM,
+            params={
+                "q": city,
+                "format": "jsonv2",
+                "limit": 1,
+            },
         )
 
-    return locations[0]
+        # Nominatim rate limit.
+        if response.status_code == 429:
+            if attempt < 2:
+                wait_time = 2 ** attempt + 1
+
+                logger.warning(
+                    "Nominatim rate limited request for %s. "
+                    "Retrying in %s seconds.",
+                    city,
+                    wait_time,
+                )
+
+                time.sleep(wait_time)
+                continue
+
+            raise RuntimeError(
+                "Nominatim rate limit reached. "
+                "Please try again later."
+            )
+
+        response.raise_for_status()
+
+        locations = response.json()
+
+        if not locations:
+            raise RuntimeError(
+                f"Could not find the location: {city}"
+            )
+
+        location = locations[0]
+
+        # Save the successful result.
+        _LOCATION_CACHE[cache_key] = location
+
+        return location
+
+    raise RuntimeError(
+        f"Could not resolve location: {city}"
+    )
 
 
 def _build_query(niche, lat, lon):
@@ -118,7 +184,7 @@ def _query_overpass(client, query):
                 },
             )
 
-            # Retry another server for rate limits and server errors.
+            # Try another server for rate limits and server errors.
             if response.status_code == 429 or response.status_code >= 500:
                 last_error = RuntimeError(
                     f"Overpass returned HTTP {response.status_code}"
@@ -184,7 +250,6 @@ def search_businesses(niche, city, limit):
         "Accept": "application/json",
     }
 
-    # 30 seconds for each HTTP request.
     timeout = httpx.Timeout(
         connect=10.0,
         read=30.0,
@@ -198,12 +263,9 @@ def search_businesses(niche, city, limit):
         follow_redirects=True,
     ) as client:
 
-        # Resolve the city first.
+        # Resolve the city. Coordinates are cached after
+        # the first successful lookup.
         location = _get_location(client, city)
-
-        # Respect Nominatim usage policy by avoiding
-        # an immediate second request.
-        time.sleep(1)
 
         tags = MAP.get(
             niche.lower(),
@@ -219,72 +281,3 @@ def search_businesses(niche, city, limit):
         query = (
             "[out:json][timeout:25];"
             "("
-            + "".join(clauses)
-            + ");"
-            "out center tags;"
-        )
-
-        data = _query_overpass(
-            client,
-            query
-        )
-
-        results = []
-        seen = set()
-
-        for element in data.get("elements", []):
-            tags_data = element.get("tags", {})
-
-            name = tags_data.get("name")
-
-            source_id = (
-                f'{element["type"]}/{element["id"]}'
-            )
-
-            # Avoid duplicates.
-            if not name or source_id in seen:
-                continue
-
-            seen.add(source_id)
-
-            center = element.get("center", {})
-
-            results.append(
-                {
-                    "source_id": source_id,
-                    "name": name,
-                    "category": (
-                        tags_data.get("amenity")
-                        or tags_data.get("shop")
-                        or tags_data.get("tourism")
-                        or niche
-                    ),
-                    "website": norm(
-                        tags_data.get("website")
-                        or tags_data.get("contact:website")
-                    ),
-                    "phone": (
-                        tags_data.get("phone")
-                        or tags_data.get("contact:phone")
-                    ),
-                    "address": tags_data.get("addr:full"),
-                    "city": (
-                        tags_data.get("addr:city")
-                        or city
-                    ),
-                    "country": tags_data.get("addr:country"),
-                    "latitude": element.get(
-                        "lat",
-                        center.get("lat")
-                    ),
-                    "longitude": element.get(
-                        "lon",
-                        center.get("lon")
-                    ),
-                }
-            )
-
-            if len(results) >= limit:
-                break
-
-        return results
