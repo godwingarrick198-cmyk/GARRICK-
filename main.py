@@ -2,11 +2,12 @@ import os,json
 from fastapi import FastAPI,HTTPException
 from pydantic import BaseModel,Field
 from database import init_db,SessionLocal
-from models import Lead,LeadStatus
+from models import Lead,LeadStatus,Campaign
 from osm import search_businesses
 from analyze import analyze_site
 from gemini import score
 from telegram import notify
+from automation import start_automation
 
 app=FastAPI(title="Garrick AI Outreach",version="1.0.0")
 class SearchRequest(BaseModel):
@@ -15,7 +16,9 @@ class SearchRequest(BaseModel):
     lead_count:int=Field(default=10,ge=1,le=50)
 
 @app.on_event("startup")
-def startup(): init_db()
+def startup():
+    init_db()
+    start_automation()
 
 @app.get("/api/health")
 def health(): return {"status":"ok","service":"garrick-ai-outreach"}
@@ -54,3 +57,17 @@ def analyze(lead_id:int):
         if lead.status==LeadStatus.QUALIFIED:
             notify(f"🔥 QUALIFIED LEAD\n\n{lead.name}\nScore: {lead.lead_score}/100\n{lead.website}\n{lead.opportunity}\nProblems: {', '.join(lead.problems)}")
         return lead.to_dict(True)
+
+@app.get("/api/campaigns")
+def campaigns(limit:int=50):
+    with SessionLocal() as db:
+        rows=db.query(Campaign).order_by(Campaign.created_at.desc()).limit(limit).all()
+        return {"campaigns":[{
+            "id":c.id,"niche":c.niche,"city":c.city,
+            "leads_per_day":c.leads_per_day,"total_days":c.total_days,
+            "days_completed":c.days_completed,"next_run":c.next_run.isoformat(),
+            "status":c.status,"created_at":c.created_at.isoformat(),
+            "last_run_at":c.last_run_at.isoformat() if c.last_run_at else None,
+            "last_error":c.last_error,
+        } for c in rows]}
+    
