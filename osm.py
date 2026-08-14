@@ -44,12 +44,8 @@ MAP = {
 logger = logging.getLogger(__name__)
 
 
-# Cache city coordinates so Garrick does not repeatedly
-# ask Nominatim to resolve the same city.
 _LOCATION_CACHE = {}
 
-# Track the last Nominatim request so we can respect
-# the public Nominatim rate limit.
 _LAST_NOMINATIM_REQUEST = 0.0
 
 
@@ -71,7 +67,6 @@ def _get_location(client, city):
 
     cache_key = city.strip().lower()
 
-    # Use cached coordinates when available.
     cached = _LOCATION_CACHE.get(cache_key)
 
     if cached:
@@ -81,7 +76,6 @@ def _get_location(client, city):
         )
         return cached
 
-    # Respect Nominatim's public usage rate.
     elapsed = time.monotonic() - _LAST_NOMINATIM_REQUEST
 
     if elapsed < 1.1:
@@ -99,7 +93,6 @@ def _get_location(client, city):
             },
         )
 
-        # Nominatim rate limit.
         if response.status_code == 429:
             if attempt < 2:
                 wait_time = 2 ** attempt + 1
@@ -130,7 +123,6 @@ def _get_location(client, city):
 
         location = locations[0]
 
-        # Save the successful result.
         _LOCATION_CACHE[cache_key] = location
 
         return location
@@ -141,7 +133,13 @@ def _get_location(client, city):
 
 
 def _build_query(niche, lat, lon):
-    """Build a relatively small Overpass query."""
+    """
+    Build a manageable Overpass query.
+
+    Uses a 10 km radius instead of 15 km to reduce the
+    amount of data returned and lower the chance of
+    Overpass gateway timeouts.
+    """
 
     tags = MAP.get(
         niche.lower(),
@@ -150,12 +148,12 @@ def _build_query(niche, lat, lon):
 
     clauses = [
         f'nwr["{key}"="{value}"]'
-        f'(around:15000,{lat},{lon});'
+        f'(around:10000,{lat},{lon});'
         for key, value in tags
     ]
 
     return (
-        "[out:json][timeout:25];"
+        "[out:json][timeout:40];"
         "("
         + "".join(clauses)
         + ");"
@@ -164,69 +162,94 @@ def _build_query(niche, lat, lon):
 
 
 def _query_overpass(client, query):
-    """Try each Overpass server until one succeeds."""
+    """Try each Overpass server with retries and backoff."""
 
     last_error = None
 
     for endpoint in OVERPASS_URLS:
-        try:
-            logger.info(
-                "Trying Overpass endpoint: %s",
-                endpoint
-            )
 
-            response = client.post(
-                endpoint,
-                content=query,
-                headers={
-                    "Content-Type": "text/plain",
-                    "Accept": "application/json",
-                },
-            )
+        for attempt in range(2):
 
-            # Try another server for rate limits and server errors.
-            if response.status_code == 429 or response.status_code >= 500:
-                last_error = RuntimeError(
-                    f"Overpass returned HTTP {response.status_code}"
+            try:
+                logger.info(
+                    "Trying Overpass endpoint: %s "
+                    "(attempt %s/2)",
+                    endpoint,
+                    attempt + 1,
                 )
+
+                response = client.post(
+                    endpoint,
+                    content=query,
+                    headers={
+                        "Content-Type": "text/plain",
+                        "Accept": "application/json",
+                    },
+                )
+
+                if response.status_code == 429:
+                    last_error = RuntimeError(
+                        f"Overpass returned HTTP 429"
+                    )
+
+                    logger.warning(
+                        "Overpass endpoint rate limited: %s",
+                        endpoint,
+                    )
+
+                    time.sleep(3)
+
+                    continue
+
+                if response.status_code >= 500:
+                    last_error = RuntimeError(
+                        f"Overpass returned HTTP "
+                        f"{response.status_code}"
+                    )
+
+                    logger.warning(
+                        "Overpass endpoint failed (%s): "
+                        "HTTP %s",
+                        endpoint,
+                        response.status_code,
+                    )
+
+                    time.sleep(2)
+
+                    continue
+
+                response.raise_for_status()
+
+                return response.json()
+
+            except (
+                httpx.TimeoutException,
+                httpx.ConnectError,
+                httpx.NetworkError,
+                httpx.RequestError,
+            ) as exc:
+
+                last_error = exc
 
                 logger.warning(
-                    "Overpass endpoint failed (%s): HTTP %s. "
-                    "Trying next endpoint.",
+                    "Overpass endpoint failed (%s): %s",
                     endpoint,
-                    response.status_code,
+                    exc,
                 )
 
-                continue
+                time.sleep(2)
 
-            response.raise_for_status()
+            except Exception as exc:
 
-            return response.json()
+                last_error = exc
 
-        except (
-            httpx.TimeoutException,
-            httpx.ConnectError,
-            httpx.NetworkError,
-            httpx.RequestError,
-        ) as exc:
-            last_error = exc
+                logger.warning(
+                    "Unexpected Overpass error (%s): %s",
+                    endpoint,
+                    exc,
+                )
 
-            logger.warning(
-                "Overpass endpoint failed (%s): %s. "
-                "Trying next endpoint.",
-                endpoint,
-                exc,
-            )
-
-        except Exception as exc:
-            last_error = exc
-
-            logger.warning(
-                "Unexpected Overpass error (%s): %s. "
-                "Trying next endpoint.",
-                endpoint,
-                exc,
-            )
+                time.sleep(2)
 
     raise RuntimeError(
         "All Overpass servers failed. "
@@ -239,10 +262,10 @@ def search_businesses(niche, city, limit):
     Search OpenStreetMap businesses.
 
     Keeps the existing interface:
+
         search_businesses(niche, city, limit)
 
-    Returns the same lead dictionary structure as the
-    previous implementation.
+    Returns the existing lead dictionary structure.
     """
 
     headers = {
@@ -252,7 +275,7 @@ def search_businesses(niche, city, limit):
 
     timeout = httpx.Timeout(
         connect=10.0,
-        read=30.0,
+        read=50.0,
         write=30.0,
         pool=10.0,
     )
@@ -263,39 +286,31 @@ def search_businesses(niche, city, limit):
         follow_redirects=True,
     ) as client:
 
-        # Resolve the city. Coordinates are cached after
-        # the first successful lookup.
-        location = _get_location(client, city)
-
-        tags = MAP.get(
-            niche.lower(),
-            [("name", niche)]
+        location = _get_location(
+            client,
+            city,
         )
 
-        clauses = [
-            f'nwr["{key}"="{value}"]'
-            f'(around:15000,{location["lat"]},{location["lon"]});'
-            for key, value in tags
-        ]
-
-        query = (
-            "[out:json][timeout:25];"
-            "("
-            + "".join(clauses)
-            + ");"
-            "out center tags;"
+        query = _build_query(
+            niche,
+            location["lat"],
+            location["lon"],
         )
 
         data = _query_overpass(
             client,
-            query
+            query,
         )
 
         results = []
         seen = set()
 
         for element in data.get("elements", []):
-            tags_data = element.get("tags", {})
+
+            tags_data = element.get(
+                "tags",
+                {},
+            )
 
             name = tags_data.get("name")
 
@@ -303,50 +318,73 @@ def search_businesses(niche, city, limit):
                 f'{element["type"]}/{element["id"]}'
             )
 
-            # Avoid duplicates within this search.
             if not name or source_id in seen:
                 continue
 
             seen.add(source_id)
 
-            center = element.get("center", {})
+            center = element.get(
+                "center",
+                {},
+            )
 
             results.append(
                 {
                     "source_id": source_id,
+
                     "name": name,
+
                     "category": (
                         tags_data.get("amenity")
                         or tags_data.get("shop")
                         or tags_data.get("tourism")
                         or niche
                     ),
+
                     "website": norm(
                         tags_data.get("website")
                         or tags_data.get("contact:website")
                     ),
+
                     "phone": (
                         tags_data.get("phone")
                         or tags_data.get("contact:phone")
                     ),
-                    "address": tags_data.get("addr:full"),
+
+                    "address": tags_data.get(
+                        "addr:full"
+                    ),
+
                     "city": (
                         tags_data.get("addr:city")
                         or city
                     ),
-                    "country": tags_data.get("addr:country"),
+
+                    "country": tags_data.get(
+                        "addr:country"
+                    ),
+
                     "latitude": element.get(
                         "lat",
-                        center.get("lat")
+                        center.get("lat"),
                     ),
+
                     "longitude": element.get(
                         "lon",
-                        center.get("lon")
+                        center.get("lon"),
                     ),
                 }
             )
 
             if len(results) >= limit:
                 break
+
+        logger.info(
+            "OSM search found %s businesses for "
+            "%s in %s",
+            len(results),
+            niche,
+            city,
+        )
 
         return results
