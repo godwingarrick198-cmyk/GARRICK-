@@ -281,3 +281,72 @@ def search_businesses(niche, city, limit):
         query = (
             "[out:json][timeout:25];"
             "("
+            + "".join(clauses)
+            + ");"
+            "out center tags;"
+        )
+
+        data = _query_overpass(
+            client,
+            query
+        )
+
+        results = []
+        seen = set()
+
+        for element in data.get("elements", []):
+            tags_data = element.get("tags", {})
+
+            name = tags_data.get("name")
+
+            source_id = (
+                f'{element["type"]}/{element["id"]}'
+            )
+
+            # Avoid duplicates within this search.
+            if not name or source_id in seen:
+                continue
+
+            seen.add(source_id)
+
+            center = element.get("center", {})
+
+            results.append(
+                {
+                    "source_id": source_id,
+                    "name": name,
+                    "category": (
+                        tags_data.get("amenity")
+                        or tags_data.get("shop")
+                        or tags_data.get("tourism")
+                        or niche
+                    ),
+                    "website": norm(
+                        tags_data.get("website")
+                        or tags_data.get("contact:website")
+                    ),
+                    "phone": (
+                        tags_data.get("phone")
+                        or tags_data.get("contact:phone")
+                    ),
+                    "address": tags_data.get("addr:full"),
+                    "city": (
+                        tags_data.get("addr:city")
+                        or city
+                    ),
+                    "country": tags_data.get("addr:country"),
+                    "latitude": element.get(
+                        "lat",
+                        center.get("lat")
+                    ),
+                    "longitude": element.get(
+                        "lon",
+                        center.get("lon")
+                    ),
+                }
+            )
+
+            if len(results) >= limit:
+                break
+
+        return results
