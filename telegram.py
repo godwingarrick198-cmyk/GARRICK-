@@ -1,4 +1,4 @@
-import os
+uimport os
 import httpx
 
 
@@ -72,7 +72,12 @@ def notify(text):
 def get_updates(offset=None, timeout=20):
     """Read Telegram updates so the automation can process private bot commands."""
     token, _ = _config()
-    params = {"timeout": timeout, "allowed_updates": '["message","channel_post"]'}
+
+    params = {
+        "timeout": timeout,
+        "allowed_updates": ["message", "channel_post"],
+    }
+
     if offset is not None:
         params["offset"] = offset
 
@@ -82,11 +87,43 @@ def get_updates(offset=None, timeout=20):
             params=params,
             timeout=timeout + 5,
         )
-        response.raise_for_status()
-        payload = response.json()
-        if not payload.get("ok"):
-            raise RuntimeError("Telegram getUpdates returned an error")
-        return payload.get("result", [])
-    except httpx.HTTPError as e:
-        raise RuntimeError(f"Telegram polling failed: {type(e).__name__}") from e
 
+        response.raise_for_status()
+
+        payload = response.json()
+
+        if not payload.get("ok"):
+            description = payload.get(
+                "description",
+                "Telegram getUpdates returned an error",
+            )
+            error_code = payload.get("error_code", "unknown")
+
+            raise RuntimeError(
+                f"Telegram getUpdates failed: "
+                f"{error_code}: {description}"
+            )
+
+        return payload.get("result", [])
+
+    except httpx.HTTPStatusError as e:
+        try:
+            data = e.response.json()
+            error_code = data.get("error_code", e.response.status_code)
+            description = data.get(
+                "description",
+                "No Telegram error description",
+            )
+        except Exception:
+            error_code = e.response.status_code
+            description = e.response.text[:500]
+
+        raise RuntimeError(
+            f"Telegram polling failed: "
+            f"{error_code}: {description}"
+        ) from e
+
+    except httpx.HTTPError as e:
+        raise RuntimeError(
+            f"Telegram polling request failed: {type(e).__name__}"
+        ) from e
