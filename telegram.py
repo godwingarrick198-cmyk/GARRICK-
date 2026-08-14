@@ -49,37 +49,16 @@ def send_message(chat_id, text):
     """Send a message to a specific Telegram chat without changing the reporting channel."""
     return _send_to_chat(chat_id, text)
 
-
 def is_channel_admin(user_id):
-    """Return True when the Telegram user is an admin/owner of TELEGRAM_CHAT_ID."""
-    token = os.getenv("TELEGRAM_BOT_TOKEN")
-    channel = os.getenv("TELEGRAM_CHAT_ID")
+    """Return True only for the configured Garrick admin Telegram user."""
+    admin_user_id = os.getenv("TELEGRAM_ADMIN_USER_ID")
 
-    if not token or not channel or not user_id:
+    if not admin_user_id or not user_id:
         return False
 
     try:
-        r = httpx.get(
-            f"https://api.telegram.org/bot{token}/getChatMember",
-            params={
-                "chat_id": channel,
-                "user_id": user_id,
-            },
-            timeout=15,
-        )
-
-        r.raise_for_status()
-
-        data = r.json()
-
-        if not data.get("ok"):
-            return False
-
-        status = (data.get("result") or {}).get("status")
-
-        return status in {"creator", "administrator"}
-
-    except httpx.HTTPError:
+        return str(user_id) == str(admin_user_id).strip()
+    except Exception:
         return False
 
 
