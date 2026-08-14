@@ -22,12 +22,17 @@ def _parse_find(text):
         return None
 
     parts = [p.strip() for p in match.group(1).split("|")]
+
     if len(parts) != 4:
-        raise ValueError("Use: /find niche | city | businesses_per_day | days")
+        raise ValueError(
+            "Use: /find niche | city | businesses_per_day | days"
+        )
 
     niche, city, per_day_text, days_text = parts
+
     if not 2 <= len(niche) <= 80:
         raise ValueError("Niche must be between 2 and 80 characters")
+
     if not 2 <= len(city) <= 120:
         raise ValueError("City must be between 2 and 120 characters")
 
@@ -35,19 +40,31 @@ def _parse_find(text):
         per_day = int(per_day_text)
         days = int(days_text)
     except ValueError as exc:
-        raise ValueError("Businesses per day and days must be whole numbers") from exc
+        raise ValueError(
+            "Businesses per day and days must be whole numbers"
+        ) from exc
 
     if not 1 <= per_day <= 50:
-        raise ValueError("Businesses per day must be between 1 and 50")
+        raise ValueError(
+            "Businesses per day must be between 1 and 50"
+        )
+
     if not 1 <= days <= 365:
-        raise ValueError("Days must be between 1 and 365")
+        raise ValueError(
+            "Days must be between 1 and 365"
+        )
 
     return niche, city, per_day, days
 
 
 def _chat_id_from_update(update):
     message = update.get("message") or update.get("channel_post")
-    return str(message.get("chat", {}).get("id")) if message else None
+
+    if not message:
+        return None
+
+    chat_id = (message.get("chat") or {}).get("id")
+    return str(chat_id) if chat_id is not None else None
 
 
 def _text_from_update(update):
@@ -57,18 +74,24 @@ def _text_from_update(update):
 
 def _handle_find(update):
     text = _text_from_update(update)
+
     if not text:
         return False
 
     message = update.get("message") or {}
     chat = message.get("chat") or {}
+
+    # Campaign commands are controlled through private DM.
     if chat.get("type") != "private":
         return True
 
     try:
         parsed = _parse_find(text)
     except ValueError as exc:
-        send_message(str(chat.get("id")), f"❌ Campaign command error\n\n{exc}")
+        send_message(
+            str(chat.get("id")),
+            f"❌ Campaign command error\n\n{exc}",
+        )
         return True
 
     if parsed is None:
@@ -77,22 +100,43 @@ def _handle_find(update):
     sender = message.get("from") or {}
     sender_id = sender.get("id")
     private_chat_id = _chat_id_from_update(update)
+
     if not sender_id or not private_chat_id:
         return True
 
-    # The reporting destination remains TELEGRAM_CHAT_ID (the channel).
-    # Only a user who is an admin of that channel can control Garrick by DM.
+    # Only an admin/owner of the configured reporting channel
+    # can create campaigns.
     if not is_channel_admin(sender_id):
-        logger.warning("Ignoring /find from a Telegram user who is not a channel admin")
-        send_message(private_chat_id, "❌ You must be an admin of Garrick's reporting channel to create campaigns.")
+        logger.warning(
+            "Ignoring /find from non-admin Telegram user"
+        )
+
+        send_message(
+            private_chat_id,
+            "❌ You must be an admin of Garrick's reporting channel "
+            "to create campaigns.",
+        )
         return True
 
     niche, city, per_day, days = parsed
-    update_id = int(update.get("update_id"))
+
+    update_id = update.get("update_id")
+
+    if update_id is None:
+        return True
+
+    update_id = int(update_id)
     now = datetime.utcnow()
 
     with SessionLocal() as db:
-        existing = db.query(Campaign).filter_by(telegram_update_id=update_id).first()
+        # Prevent the same Telegram command from creating
+        # multiple campaigns.
+        existing = (
+            db.query(Campaign)
+            .filter_by(telegram_update_id=update_id)
+            .first()
+        )
+
         if existing:
             return True
 
@@ -106,6 +150,7 @@ def _handle_find(update):
             status="ACTIVE",
             telegram_update_id=update_id,
         )
+
         db.add(campaign)
         db.commit()
         campaign_id = campaign.id
@@ -119,8 +164,9 @@ def _handle_find(update):
         f"Days: {days}\n"
         f"Campaign ID: {campaign_id}\n\n"
         "Garrick will start the first run automatically.\n"
-        "Qualified leads will be reported to your channel."
+        "Qualified leads will be reported to your channel.",
     )
+
     return True
 
 
@@ -130,46 +176,72 @@ def _process_lead(db, lead):
         db.commit()
         return
 
-    if lead.status in (LeadStatus.ANALYZED, LeadStatus.QUALIFIED, LeadStatus.CONTACTED, LeadStatus.CLIENT):
+    if lead.status in (
+        LeadStatus.ANALYZED,
+        LeadStatus.QUALIFIED,
+        LeadStatus.CONTACTED,
+        LeadStatus.CLIENT,
+    ):
         return
 
     try:
         site = analyze_site(lead.website)
+
         lead.website_score = site.get("website_score")
         lead.analysis = site
 
         ai = score(lead.to_dict(), site)
+
         lead.lead_score = ai.get("lead_score")
         lead.problems = ai.get("problems", [])
         lead.opportunity = ai.get("opportunity", "")
-        lead.status = LeadStatus.QUALIFIED if lead.lead_score >= 80 else LeadStatus.ANALYZED
-        db.commit()
 
-        if lead.status == LeadStatus.QUALIFIED:
-            try:
-                notify(
-                    "🔥 QUALIFIED LEAD\n\n"
-                    f"{lead.name}\n"
-                    f"City: {lead.city}\n"
-                    f"Score: {lead.lead_score}/100\n"
-                    f"Website: {lead.website}\n"
-                    f"Opportunity: {lead.opportunity}\n"
-                    f"Problems: {', '.join(lead.problems or [])}"
-                )
-            except Exception:
-                logger.exception("Telegram notification failed for lead %s", lead.id)
+        if lead.lead_score is not None and lead.lead_score >= 80:
+            lead.status = LeadStatus.QUALIFIED
+        else:
+            lead.status = LeadStatus.ANALYZED
+
+        db.commit()
 
     except Exception:
         db.rollback()
-        logger.exception("Lead analysis failed for lead %s", lead.id)
+        logger.exception(
+            "Lead analysis failed for lead %s",
+            lead.id,
+        )
+        return
+
+    # Telegram reporting happens AFTER the lead database update.
+    # A Telegram failure must NOT cause the campaign day to be
+    # rolled back or counted incorrectly.
+    if lead.status == LeadStatus.QUALIFIED:
+        try:
+            notify(
+                "🔥 QUALIFIED LEAD\n\n"
+                f"{lead.name}\n"
+                f"City: {lead.city}\n"
+                f"Score: {lead.lead_score}/100\n"
+                f"Website: {lead.website}\n"
+                f"Opportunity: {lead.opportunity}\n"
+                f"Problems: {', '.join(lead.problems or [])}"
+            )
+        except Exception:
+            logger.exception(
+                "Telegram notification failed for lead %s",
+                lead.id,
+            )
 
 
 def _run_campaign(campaign_id):
     with SessionLocal() as db:
         campaign = db.get(Campaign, campaign_id)
+
         if not campaign or campaign.status != "ACTIVE":
             return
-        if campaign.next_run > datetime.utcnow():
+
+        now = datetime.utcnow()
+
+        if campaign.next_run > now:
             return
 
         logger.info(
@@ -180,70 +252,131 @@ def _run_campaign(campaign_id):
         )
 
         try:
-            # Ask OSM for a larger pool so existing source_id duplicates do not
-            # consume the whole daily quota.
-            pool_size = min(max(campaign.leads_per_day * 5, campaign.leads_per_day), 50)
-            rows = search_businesses(campaign.niche, campaign.city, pool_size)
+            # Search a larger pool so duplicate/existing businesses
+            # do not consume the requested daily quota.
+            pool_size = min(
+                max(campaign.leads_per_day * 5, campaign.leads_per_day),
+                50,
+            )
+
+            rows = search_businesses(
+                campaign.niche,
+                campaign.city,
+                pool_size,
+            )
 
             selected = []
+
             for row in rows:
-                existing = db.query(Lead).filter_by(source_id=row["source_id"]).first()
+                source_id = row.get("source_id")
+
+                if not source_id:
+                    continue
+
+                # IMPORTANT:
+                # Existing leads are never selected again for the
+                # daily campaign quota.
+                existing = (
+                    db.query(Lead)
+                    .filter_by(source_id=source_id)
+                    .first()
+                )
+
                 if existing:
-                    if existing.status == LeadStatus.NEW:
-                        selected.append(existing)
                     continue
 
                 lead = Lead(**row)
+
                 db.add(lead)
                 db.commit()
                 db.refresh(lead)
+
                 selected.append(lead)
 
                 if len(selected) >= campaign.leads_per_day:
                     break
 
+            # Analyze the selected new leads.
             for lead in selected:
                 _process_lead(db, lead)
 
+            # Mark the campaign day complete only after all selected
+            # leads have been processed.
+            completed_at = datetime.utcnow()
+
             campaign.days_completed += 1
-            campaign.last_run_at = datetime.utcnow()
+            campaign.last_run_at = completed_at
             campaign.last_error = None
 
             if campaign.days_completed >= campaign.total_days:
                 campaign.status = "COMPLETED"
-                campaign.next_run = campaign.last_run_at
+                campaign.next_run = completed_at
             else:
-                campaign.next_run = campaign.next_run + timedelta(days=1)
+                campaign.next_run = (
+                    campaign.next_run + timedelta(days=1)
+                )
 
             db.commit()
 
-            notify(
-                "📊 Campaign update\n\n"
-                f"Campaign {campaign.id}: {campaign.niche} in {campaign.city}\n"
-                f"Completed day {campaign.days_completed}/{campaign.total_days}\n"
-                f"New/processable businesses: {len(selected)}"
-            )
+            # IMPORTANT:
+            # This notification is deliberately outside the main
+            # campaign transaction. If Telegram fails, the campaign
+            # remains correctly marked as completed for the day.
+            try:
+                notify(
+                    "📊 Campaign update\n\n"
+                    f"Campaign {campaign.id}: "
+                    f"{campaign.niche} in {campaign.city}\n"
+                    f"Completed day "
+                    f"{campaign.days_completed}/"
+                    f"{campaign.total_days}\n"
+                    f"New businesses processed: {len(selected)}"
+                )
+            except Exception:
+                logger.exception(
+                    "Campaign notification failed for campaign %s",
+                    campaign.id,
+                )
 
         except Exception as exc:
             db.rollback()
+
+            # Only record the failure if the campaign itself still
+            # exists and is active.
             campaign = db.get(Campaign, campaign_id)
-            if campaign:
+
+            if campaign and campaign.status == "ACTIVE":
                 campaign.last_error = type(exc).__name__
-                campaign.next_run = datetime.utcnow() + timedelta(hours=1)
+
+                # Retry failed campaign work later rather than
+                # losing the campaign.
+                campaign.next_run = (
+                    datetime.utcnow() + timedelta(hours=1)
+                )
+
                 db.commit()
-            logger.exception("Campaign %s failed; retrying later", campaign_id)
+
+            logger.exception(
+                "Campaign %s failed; retrying later",
+                campaign_id,
+            )
 
 
 def _run_due_campaigns():
     now = datetime.utcnow()
+
     with SessionLocal() as db:
         campaigns = (
             db.query(Campaign)
-            .filter(Campaign.status == "ACTIVE", Campaign.next_run <= now)
+            .filter(
+                Campaign.status == "ACTIVE",
+                Campaign.next_run <= now,
+            )
             .order_by(Campaign.next_run.asc())
             .all()
         )
-        ids = [c.id for c in campaigns]
+
+        ids = [campaign.id for campaign in campaigns]
 
     for campaign_id in ids:
         _run_campaign(campaign_id)
@@ -251,26 +384,45 @@ def _run_due_campaigns():
 
 def _loop():
     offset = None
+
     while True:
         try:
-            updates = get_updates(offset=offset, timeout=20)
+            updates = get_updates(
+                offset=offset,
+                timeout=20,
+            )
+
             for update in updates:
                 offset = int(update["update_id"]) + 1
+
                 try:
                     _handle_find(update)
                 except Exception:
-                    logger.exception("Telegram command processing failed")
+                    logger.exception(
+                        "Telegram command processing failed"
+                    )
+
         except Exception:
-            logger.exception("Telegram polling cycle failed")
+            logger.exception(
+                "Telegram polling cycle failed"
+            )
             time.sleep(10)
 
         try:
             _run_due_campaigns()
         except Exception:
-            logger.exception("Due campaign processing failed")
+            logger.exception(
+                "Due campaign processing failed"
+            )
 
 
 def start_automation():
-    thread = threading.Thread(target=_loop, name="garrick-automation", daemon=True)
+    thread = threading.Thread(
+        target=_loop,
+        name="garrick-automation",
+        daemon=True,
+    )
+
     thread.start()
+
     logger.info("Garrick automation started")
