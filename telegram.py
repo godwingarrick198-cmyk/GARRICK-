@@ -1,4 +1,7 @@
+import hashlib
+import json
 import os
+
 import httpx
 
 
@@ -16,124 +19,84 @@ def _send_to_chat(chat_id, text):
         return False
 
     try:
-        r = httpx.post(
+        response = httpx.post(
             f"https://api.telegram.org/bot{token}/sendMessage",
             json={"chat_id": chat_id, "text": text},
             timeout=15,
         )
-
-        if r.is_error:
-            try:
-                description = r.json().get(
-                    "description",
-                    "Unknown Telegram error",
-                )
-            except Exception:
-                description = "Telegram returned an invalid error response"
-
-            raise RuntimeError(
-                f"Telegram sendMessage failed "
-                f"({r.status_code}): {description}"
-            )
-
-        r.raise_for_status()
+        response.raise_for_status()
+        payload = response.json()
+        if not payload.get("ok"):
+            raise RuntimeError("Telegram sendMessage failed")
         return True
 
-    except httpx.HTTPError as e:
+    except httpx.HTTPStatusError as exc:
+        try:
+            description = exc.response.json().get(
+                "description",
+                "Telegram rejected the request",
+            )
+        except Exception:
+            description = "Telegram rejected the request"
+
         raise RuntimeError(
-            f"Telegram request failed: {type(e).__name__}"
-        ) from e
+            f"Telegram sendMessage failed ({exc.response.status_code}): {description}"
+        ) from exc
+
+    except httpx.HTTPError as exc:
+        raise RuntimeError(
+            f"Telegram request failed: {type(exc).__name__}"
+        ) from exc
 
 
 def send_message(chat_id, text):
-    """Send a message to a specific Telegram chat without changing the reporting channel."""
+    """Send a private confirmation/message without changing the reporting channel."""
     return _send_to_chat(chat_id, text)
 
+
 def is_channel_admin(user_id):
-    """Return True only for the configured Garrick admin Telegram user."""
+    """Authorize Garrick campaign control using the configured Telegram user ID."""
     admin_user_id = os.getenv("TELEGRAM_ADMIN_USER_ID")
 
     if not admin_user_id or not user_id:
         return False
 
-    try:
-        return str(user_id) == str(admin_user_id).strip()
-    except Exception:
-        return False
+    return str(user_id).strip() == str(admin_user_id).strip()
 
 
 def notify(text):
-    """Send a report to the configured Telegram channel."""
+    """Send lead/campaign reports to the configured Telegram channel."""
     chat = os.getenv("TELEGRAM_CHAT_ID")
     return _send_to_chat(chat, text)
 
 
-def get_updates(offset=None, timeout=20):
-    """Read Telegram updates so the automation can process private bot commands."""
+def webhook_secret():
+    """Return a deterministic webhook secret derived from the private bot token."""
     token, _ = _config()
+    return hashlib.sha256(token.encode()).hexdigest()
 
-    params = {
-        "timeout": timeout,
-        "allowed_updates": ["message", "channel_post"],
-    }
 
-    if offset is not None:
-        params["offset"] = offset
+def set_webhook(public_base_url):
+    """Tell Telegram to deliver bot updates to the FastAPI webhook."""
+    token, _ = _config()
+    base = public_base_url.rstrip("/")
+    webhook_url = f"{base}/telegram/webhook"
 
-    try:
-        response = httpx.get(
-            f"https://api.telegram.org/bot{token}/getUpdates",
-            params=params,
-            timeout=timeout + 5,
-        )
+    response = httpx.post(
+        f"https://api.telegram.org/bot{token}/setWebhook",
+        params={
+            "url": webhook_url,
+            "allowed_updates": json.dumps(["message", "channel_post"]),
+            "drop_pending_updates": "false",
+            "secret_token": webhook_secret(),
+        },
+        timeout=15,
+    )
+    response.raise_for_status()
 
-        response.raise_for_status()
+    payload = response.json()
+    if not payload.get("ok"):
+        raise RuntimeError("Telegram webhook configuration failed")
 
-        payload = response.json()
-
-        if not payload.get("ok"):
-            description = payload.get(
-                "description",
-                "Telegram getUpdates returned an error",
-            )
-
-            error_code = payload.get(
-                "error_code",
-                "unknown",
-            )
-
-            raise RuntimeError(
-                f"Telegram getUpdates failed: "
-                f"{error_code}: {description}"
-            )
-
-        return payload.get("result", [])
-
-    except httpx.HTTPStatusError as e:
-        try:
-            data = e.response.json()
-
-            error_code = data.get(
-                "error_code",
-                e.response.status_code,
-            )
-
-            description = data.get(
-                "description",
-                "No Telegram error description",
-            )
-
-        except Exception:
-            error_code = e.response.status_code
-            description = e.response.text[:500]
-
-        raise RuntimeError(
-            f"Telegram polling failed: "
-            f"{error_code}: {description}"
-        ) from e
-
-    except httpx.HTTPError as e:
-        raise RuntimeError(
-            f"Telegram polling request failed: "
-            f"{type(e).__name__}"
-        ) from e
+    return webhook_url
+            
