@@ -845,4 +845,217 @@ def _run_campaign(campaign_id):
 
                     if (
                         len(selected)
-       
+                        >= campaign.leads_per_day
+                    ):
+                        break
+
+                # Analyze/report selected leads.
+                for lead in selected:
+                    _process_lead(
+                        db,
+                        lead,
+                    )
+
+                completed_at = _utcnow()
+
+                campaign.days_completed += 1
+                campaign.last_run_at = completed_at
+                campaign.last_error = None
+
+                if (
+                    campaign.days_completed
+                    >= campaign.total_days
+                ):
+                    campaign.status = "COMPLETED"
+                    campaign.next_run = completed_at
+
+                else:
+                    # Schedule the next campaign day
+                    # 24 hours after THIS successful run.
+                    campaign.status = "ACTIVE"
+
+                    campaign.next_run = (
+                        completed_at
+                        + timedelta(days=1)
+                    )
+
+                db.commit()
+
+                try:
+                    next_run_text = (
+                        campaign.next_run.isoformat(
+                            sep=" "
+                        )
+                        if campaign.status == "ACTIVE"
+                        else "Completed"
+                    )
+
+                    notify(
+                        "📊 Campaign update\n\n"
+                        f"Campaign {campaign.id}: "
+                        f"{campaign.niche} in "
+                        f"{campaign.city}\n"
+                        f"Completed day "
+                        f"{campaign.days_completed}/"
+                        f"{campaign.total_days}\n"
+                        f"New businesses processed: "
+                        f"{len(selected)}\n"
+                        f"Next run (UTC): "
+                        f"{next_run_text}"
+                    )
+
+                except Exception:
+                    logger.exception(
+                        "Campaign notification failed "
+                        "for campaign %s",
+                        campaign.id,
+                    )
+
+            except Exception as exc:
+                db.rollback()
+
+                campaign = db.get(
+                    Campaign,
+                    campaign_id,
+                )
+
+                if campaign:
+                    campaign.status = "ACTIVE"
+
+                    campaign.last_error = (
+                        f"{type(exc).__name__}: "
+                        f"{str(exc)[:250]}"
+                    )
+
+                    # Retry failed campaigns sooner instead
+                    # of waiting for the next day.
+                    campaign.next_run = (
+                        _utcnow()
+                        + timedelta(minutes=10)
+                    )
+
+                    db.commit()
+
+                logger.exception(
+                    "Campaign %s failed; "
+                    "scheduled retry.",
+                    campaign_id,
+                )
+
+                try:
+                    notify(
+                        "⚠️ CAMPAIGN RETRY\n\n"
+                        f"Campaign {campaign_id} "
+                        "could not complete this run.\n\n"
+                        f"Reason: "
+                        f"{type(exc).__name__}\n\n"
+                        "Garrick will retry automatically "
+                        "in about 10 minutes."
+                    )
+
+                except Exception:
+                    logger.exception(
+                        "Failed to send campaign "
+                        "failure notification."
+                    )
+
+    finally:
+        lock.release()
+
+
+def _run_due_campaigns():
+    now = _utcnow()
+
+    with SessionLocal() as db:
+        campaigns = (
+            db.query(Campaign)
+            .filter(
+                Campaign.status == "ACTIVE",
+                Campaign.next_run <= now,
+            )
+            .order_by(
+                Campaign.next_run.asc()
+            )
+            .all()
+        )
+
+        ids = [
+            campaign.id
+            for campaign in campaigns
+        ]
+
+    for campaign_id in ids:
+        threading.Thread(
+            target=_run_campaign,
+            args=(campaign_id,),
+            name=f"campaign-{campaign_id}",
+            daemon=True,
+        ).start()
+
+
+def _loop():
+    """
+    Campaign scheduler.
+
+    IMPORTANT:
+    There is deliberately NO Telegram getUpdates()
+    polling here. Telegram commands arrive through
+    the FastAPI webhook.
+    """
+
+    while True:
+        try:
+            _run_due_campaigns()
+
+        except Exception:
+            logger.exception(
+                "Due campaign processing failed"
+            )
+
+        time.sleep(
+            SCHEDULER_INTERVAL_SECONDS
+        )
+
+
+def start_automation():
+    global _AUTOMATION_STARTED
+
+    with _AUTOMATION_LOCK:
+        if _AUTOMATION_STARTED:
+            logger.info(
+                "Garrick automation already started"
+            )
+            return
+
+        _AUTOMATION_STARTED = True
+
+    # Recover campaigns interrupted by Render restart.
+    try:
+        _recover_interrupted_campaigns()
+
+    except Exception:
+        logger.exception(
+            "Interrupted campaign recovery failed"
+        )
+
+    # Immediately run campaigns that are already due.
+    try:
+        _run_due_campaigns()
+
+    except Exception:
+        logger.exception(
+            "Startup campaign catch-up failed"
+        )
+
+    thread = threading.Thread(
+        target=_loop,
+        name="garrick-automation",
+        daemon=True,
+    )
+
+    thread.start()
+
+    logger.info(
+        "Garrick automation started"
+            )
+    
