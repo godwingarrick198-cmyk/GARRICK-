@@ -811,7 +811,7 @@ def _run_campaign(campaign_id):
                         f"New businesses processed: "
                         f"{len(selected)}\n"
                         f"Next run (UTC): "
-                        f"{campaign.next_run.isoformat(sep=' ') "
+                        f"{campaign.next_run.isoformat(sep=' ')}"
                         f"if campaign.status == 'ACTIVE' "
                         f"else 'Completed'}"
                     )
